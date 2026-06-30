@@ -29,7 +29,7 @@ use ashmaize::hash;
 let digest = hash(b"salt", &rom, 8, 256);
 # assert_eq!(
 #      digest,
-#      [39, 200, 35, 132, 250, 151, 62, 36, 195, 37, 55, 6, 49, 113, 39, 252, 116, 112, 101, 81, 253, 131, 10, 219, 152, 249, 52, 72, 200, 130, 140, 178, 31, 219, 153, 103, 73, 154, 110, 196, 245, 10, 65, 203, 223, 3, 64, 51, 154, 179, 86, 174, 136, 107, 27, 89, 29, 235, 97, 95, 230, 159, 207, 58]
+#      [42, 210, 239, 12, 214, 251, 233, 4, 197, 100, 95, 113, 166, 237, 111, 169, 32, 5, 72, 109, 92, 228, 39, 145, 24, 72, 183, 43, 35, 169, 243, 99, 149, 36, 221, 187, 18, 191, 160, 215, 58, 250, 22, 134, 181, 182, 39, 96, 170, 75, 207, 180, 51, 25, 64, 232, 189, 26, 226, 52, 76, 78, 100, 235]
 # );```
 
 */
@@ -44,9 +44,8 @@ use cryptoxide::{
 use self::rom::RomDigest;
 pub use self::rom::{Rom, RomGenerationType};
 
-// 1 byte operator
-// 3 bytes operands (src1, src2, dst)
-// 28 bytes data
+// instruction layout (20 bytes):
+//   opcode(1) | src-operand nibbles(1) | packed register indices(2) | lit1(8) | lit2(8)
 const INSTR_SIZE: usize = 20;
 const NB_REGS: usize = 1 << REGS_BITS;
 const REGS_BITS: usize = 5;
@@ -83,6 +82,8 @@ enum Op3 {
     Div,
     Mod,
     And,
+    RotL,
+    RotR,
     Hash(u8),
 }
 
@@ -91,8 +92,6 @@ enum Op2 {
     ISqrt,
     Neg,
     BitRev,
-    RotL,
-    RotR,
 }
 
 // special encoding
@@ -108,8 +107,8 @@ impl From<u8> for Instr {
             128..138 => Instr::Op2(Op2::ISqrt),              // 10
             138..148 => Instr::Op2(Op2::BitRev),             // 10
             148..188 => Instr::Op3(Op3::Xor),                // 40
-            188..204 => Instr::Op2(Op2::RotL),               // 16
-            204..220 => Instr::Op2(Op2::RotR),               // 16
+            188..204 => Instr::Op3(Op3::RotL),               // 16
+            204..220 => Instr::Op3(Op3::RotR),               // 16
             220..240 => Instr::Op2(Op2::Neg),                // 20
             240..248 => Instr::Op3(Op3::And),                // 8
             248..=255 => Instr::Op3(Op3::Hash(value - 248)), // 8
@@ -130,10 +129,10 @@ impl From<u8> for Operand {
     fn from(value: u8) -> Self {
         assert!(value <= 0x0f);
         match value {
-            0..5 => Self::Reg,
-            5..9 => Self::Memory,
-            9..13 => Self::Literal,
-            13..14 => Self::Special1,
+            0..4 => Self::Reg,
+            4..8 => Self::Memory,
+            8..12 => Self::Literal,
+            12..14 => Self::Special1,
             14.. => Self::Special2,
         }
     }
@@ -160,8 +159,8 @@ impl VM {
         }
 
         let mut digests = init_buffer_digests.chunks(DIGEST_INIT_SIZE);
-        let prog_digest = Blake2b::<512>::new().update(&digests.next().unwrap());
-        let mem_digest = Blake2b::<512>::new().update(&digests.next().unwrap());
+        let prog_digest = Blake2b::<512>::new().update(digests.next().unwrap());
+        let mem_digest = Blake2b::<512>::new().update(digests.next().unwrap());
         let prog_seed = *<&[u8; 64]>::try_from(digests.next().unwrap()).unwrap();
 
         assert_eq!(digests.next(), None);
@@ -192,16 +191,10 @@ impl VM {
     pub fn post_instructions(&mut self) {
         let sum_regs = self.sum_regs();
 
-        let prog_value = self
-            .prog_digest
-            .clone()
-            .update(&sum_regs.to_le_bytes())
-            .finalize();
-        let mem_value = self
-            .mem_digest
-            .clone()
-            .update(&sum_regs.to_le_bytes())
-            .finalize();
+        self.prog_digest.update_mut(&sum_regs.to_le_bytes());
+        let prog_value = self.prog_digest.clone().finalize();
+        self.mem_digest.update_mut(&sum_regs.to_le_bytes());
+        let mem_value = self.mem_digest.clone().finalize();
 
         let mixing_value = Blake2b::<512>::new()
             .update(&prog_value)
@@ -262,13 +255,19 @@ struct Program {
 
 impl Program {
     pub fn new(nb_instrs: u32) -> Self {
-        let size = nb_instrs as usize * INSTR_SIZE;
+        let size = (nb_instrs as usize)
+            .checked_mul(INSTR_SIZE)
+            .expect("program byte size overflows usize");
         let instructions = vec![0; size];
         Self { instructions }
     }
 
     pub fn at(&self, i: u32) -> &[u8; INSTR_SIZE] {
-        let start = (i as usize).wrapping_mul(INSTR_SIZE) % self.instructions.len();
+        // reduce the index modulo the instruction count BEFORE scaling so the
+        // result is identical on 32-bit (wasm) and 64-bit targets; scaling first
+        // could overflow `usize` on wasm32 once `i` (the never-reset ip) grows.
+        let nb_instructions = self.instructions.len() / INSTR_SIZE;
+        let start = (i as usize % nb_instructions) * INSTR_SIZE;
         <&[u8; INSTR_SIZE]>::try_from(&self.instructions[start..start + INSTR_SIZE]).unwrap()
     }
 
@@ -322,10 +321,11 @@ fn execute_one_instruction(vm: &mut VM, rom: &Rom) {
         ($vm:ident, $rom:ident, $addr:ident) => {{
             let mem = rom.at($addr as u32);
             $vm.mem_digest.update_mut(mem);
-            $vm.memory_counter = $vm.memory_counter.wrapping_add(1);
 
-            // divide memory access into 8 chunks of 8 bytes
+            // use the i'th 8-byte chunk of the 64-byte line selected by the
+            // current counter, THEN increment (spec: counter incremented after read)
             let idx = (($vm.memory_counter % (64 / 8)) as usize) * 8;
+            $vm.memory_counter = $vm.memory_counter.wrapping_add(1);
             u64::from_le_bytes(*<&[u8; 8]>::try_from(&mem[idx..idx + 8]).unwrap())
         }};
     }
@@ -341,6 +341,19 @@ fn execute_one_instruction(vm: &mut VM, rom: &Rom) {
         ($vm:ident) => {{
             let r = $vm.mem_digest.clone().finalize();
             u64::from_le_bytes(*<&[u8; 8]>::try_from(&r[0..8]).unwrap())
+        }};
+    }
+
+    // resolve a divisor: if zero, the divisor is replaced by special-value1
+    // (and a zero special-value1 falls back to 1 to avoid division by zero)
+    macro_rules! nonzero_divisor {
+        ($vm:ident, $src2:ident) => {{
+            if $src2 == 0 {
+                let s = special1_value64!($vm);
+                if s == 0 { 1 } else { s }
+            } else {
+                $src2
+            }
         }};
     }
 
@@ -377,21 +390,11 @@ fn execute_one_instruction(vm: &mut VM, rom: &Rom) {
                 Op3::Mul => src1.wrapping_mul(src2),
                 Op3::MulH => ((src1 as u128 * src2 as u128) >> 64) as u64,
                 Op3::Xor => src1 ^ src2,
-                Op3::Div => {
-                    if src2 == 0 {
-                        special1_value64!(vm)
-                    } else {
-                        src1 / src2
-                    }
-                }
-                Op3::Mod => {
-                    if src2 == 0 {
-                        special1_value64!(vm)
-                    } else {
-                        src1 / src2
-                    }
-                }
+                Op3::Div => src1 / nonzero_divisor!(vm, src2),
+                Op3::Mod => src1 % nonzero_divisor!(vm, src2),
                 Op3::And => src1 & src2,
+                Op3::RotL => src1.rotate_left(src2 as u32),
+                Op3::RotR => src1.rotate_right(src2 as u32),
                 Op3::Hash(v) => {
                     assert!(v < 8);
                     let out = Blake2b::<512>::new()
@@ -419,8 +422,6 @@ fn execute_one_instruction(vm: &mut VM, rom: &Rom) {
 
             let result = match operator {
                 Op2::Neg => !src1,
-                Op2::RotL => src1.rotate_left(r1 as u32),
-                Op2::RotR => src1.rotate_right(r1 as u32),
                 Op2::ISqrt => src1.isqrt(),
                 Op2::BitRev => src1.reverse_bits(),
             };
@@ -445,7 +446,7 @@ fn execute_one_instruction(vm: &mut VM, rom: &Rom) {
 ///
 pub fn hash(salt: &[u8], rom: &Rom, nb_loops: u32, nb_instrs: u32) -> [u8; 64] {
     assert!(nb_loops >= 2);
-    assert!(nb_instrs >= 256);
+    assert!(nb_instrs >= 128);
     let mut vm = VM::new(&rom.digest, nb_instrs, salt);
     for _ in 0..nb_loops {
         vm.execute(rom, nb_instrs);
@@ -472,6 +473,52 @@ mod tests {
         let h2 = hash(&0u128.to_be_bytes(), &rom, 8, 257);
 
         assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn min_size_and_min_instrs() {
+        // smallest legal ROM (one 64-byte cacheline) plus the spec minimums
+        // (nb_loops = 2, nb_instrs = 128) must run without panicking.
+        let rom = Rom::new(b"k", RomGenerationType::FullRandom, 64);
+        let a = hash(b"s", &rom, 2, 128);
+        let b = hash(b"s", &rom, 2, 128);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn twostep_non_power_of_two_pre_size() {
+        // pre_size = 192 (3 * 64) is a valid multiple of 64 but not a power of
+        // two; this used to be rejected by an over-strict assertion.
+        let rom = Rom::new(
+            b"k",
+            RomGenerationType::TwoStep {
+                pre_size: 192,
+                mixing_numbers: 4,
+            },
+            64 * 64,
+        );
+        let a = hash(b"s", &rom, 2, 128);
+        let b = hash(b"s", &rom, 2, 128);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    #[should_panic]
+    fn rejects_non_multiple_of_64_size() {
+        let _ = Rom::new(b"k", RomGenerationType::FullRandom, 100);
+    }
+
+    #[test]
+    #[should_panic]
+    fn rejects_pre_size_larger_than_rom() {
+        let _ = Rom::new(
+            b"k",
+            RomGenerationType::TwoStep {
+                pre_size: 128,
+                mixing_numbers: 4,
+            },
+            64,
+        );
     }
 
     /*
@@ -515,10 +562,10 @@ mod tests {
         const NB_INSTR: u32 = 256;
 
         const EXPECTED: [u8; 64] = [
-            56, 148, 1, 228, 59, 96, 211, 173, 9, 98, 68, 61, 89, 171, 124, 171, 124, 183, 200,
-            196, 29, 43, 133, 168, 218, 217, 255, 71, 234, 182, 97, 158, 231, 156, 56, 230, 61, 54,
-            248, 199, 150, 15, 66, 0, 149, 185, 85, 177, 192, 220, 237, 77, 195, 106, 140, 223,
-            175, 93, 238, 220, 57, 159, 180, 243,
+            118, 142, 59, 19, 242, 229, 217, 97, 115, 38, 167, 56, 121, 151, 183, 246, 214, 145,
+            208, 104, 222, 217, 220, 208, 73, 247, 247, 175, 107, 193, 179, 137, 99, 168, 68, 177,
+            2, 71, 92, 42, 62, 95, 219, 229, 255, 221, 116, 101, 163, 104, 95, 252, 165, 44, 215,
+            109, 62, 126, 71, 158, 82, 151, 210, 127,
         ];
 
         let rom = Rom::new(

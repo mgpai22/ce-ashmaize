@@ -1,5 +1,5 @@
 use cryptoxide::{
-    hashing::blake2b::{self, Blake2b},
+    hashing::blake2b::Blake2b,
     kdf::argon2,
 };
 
@@ -33,10 +33,10 @@ pub enum RomGenerationType {
     /// This option is faster to execute and not necessarily
     /// weaker than [`FullRandom`].
     TwoStep {
-        /// the pre-memory size
+        /// the pre-memory size in bytes
         ///
-        /// This must be a power of `2` otherwise it will triger
-        /// a panic during execution
+        /// Must be a non-zero multiple of 64 (the cacheline size) and at
+        /// most the ROM `size`. Otherwise [`Rom::new`] panics.
         pre_size: usize,
         /// number of chunks to randomly combine (e.g. 4)
         mixing_numbers: usize,
@@ -52,8 +52,9 @@ impl Rom {
     ///
     /// # Panic
     ///
-    /// this function may panic if the `pre_size` field in [`RomGenerationType::TwoStep`]
-    /// is not a power of `2`.
+    /// Panics if `size` is not a non-zero multiple of 64 bytes that fits in
+    /// 32 bits, or if [`RomGenerationType::TwoStep`]'s `pre_size` is not a
+    /// non-zero multiple of 64 bytes that is at most `size`.
     ///
     /// # Examples
     ///
@@ -74,10 +75,15 @@ impl Rom {
     /// ```
     ///
     pub fn new(key: &[u8], gen_type: RomGenerationType, size: usize) -> Self {
+        assert!(
+            size >= DATASET_ACCESS_SIZE && size.is_multiple_of(DATASET_ACCESS_SIZE),
+            "ROM size must be a non-zero multiple of 64 bytes"
+        );
+        assert!(size <= u32::MAX as usize, "ROM size must fit in 32 bits");
         let mut data = vec![0; size];
 
-        let seed = blake2b::Context::<256>::new()
-            .update(&(data.len() as u32).to_le_bytes())
+        let seed = Blake2b::<512>::new()
+            .update(&(size as u32).to_le_bytes())
             .update(key)
             .finalize();
         let digest = random_gen(gen_type, seed, &mut data);
@@ -86,32 +92,45 @@ impl Rom {
     }
 
     pub(crate) fn at(&self, i: u32) -> &[u8; DATASET_ACCESS_SIZE] {
-        let start = i as usize % (self.data.len() / DATASET_ACCESS_SIZE);
+        let nb_lines = self.data.len() / DATASET_ACCESS_SIZE;
+        let start = (i as usize % nb_lines) * DATASET_ACCESS_SIZE;
         <&[u8; DATASET_ACCESS_SIZE]>::try_from(&self.data[start..start + DATASET_ACCESS_SIZE])
             .unwrap()
     }
 }
 
-fn random_gen(gen_type: RomGenerationType, seed: [u8; 32], output: &mut [u8]) -> RomDigest {
+fn random_gen(gen_type: RomGenerationType, seed: [u8; 64], output: &mut [u8]) -> RomDigest {
+    const CHUNK: usize = DATASET_ACCESS_SIZE; // 64-byte cacheline
+
     if let RomGenerationType::TwoStep {
         pre_size,
         mixing_numbers,
     } = gen_type
     {
-        assert!(pre_size.is_power_of_two());
-        let mut mixing_buffer = vec![0; pre_size];
+        assert!(
+            pre_size >= CHUNK && pre_size.is_multiple_of(CHUNK),
+            "pre_size must be a non-zero multiple of 64 bytes"
+        );
+        assert!(
+            pre_size <= output.len(),
+            "pre_size must not exceed the ROM size"
+        );
+        assert!(mixing_numbers >= 1, "mixing_numbers must be at least 1");
 
-        argon2::hprime(&mut mixing_buffer, &seed);
+        // 1. build the small, strictly-sequential pre-ROM
+        let mut pre_rom = vec![0; pre_size];
+        argon2::hprime(&mut pre_rom, &seed);
 
         const OFFSET_LOOPS: u32 = 4;
 
-        // generate a 32 u16s iterator from a digest
+        // generate a 32-u16 iterator from a 64-byte digest
         fn digest_to_u16s(digest: &[u8; 64]) -> impl Iterator<Item = u16> {
             digest
                 .chunks(2)
                 .map(|c| u16::from_le_bytes(*<&[u8; 2]>::try_from(c).unwrap()))
         }
 
+        // 2. relative offsets, shared across all output chunks
         let mut offsets_diff = vec![];
         for i in 0u32..OFFSET_LOOPS {
             let command = Blake2b::<512>::new()
@@ -123,33 +142,29 @@ fn random_gen(gen_type: RomGenerationType, seed: [u8; 32], output: &mut [u8]) ->
         }
         assert_eq!(offsets_diff.len(), 32 * OFFSET_LOOPS as usize);
 
-        let nb_chunks_bytes = output.len() / 64;
-        let mut offsets_bytes = vec![0; nb_chunks_bytes];
-
-        let offset_bytes_input = Blake2b::<512>::new()
+        // 3. one base-offset byte per output chunk
+        let nb_out_chunks = output.len() / CHUNK;
+        let mut offset_base = vec![0u8; nb_out_chunks];
+        let offset_base_input = Blake2b::<512>::new()
             .update(&seed)
-            .update(b"generation offset base")
+            .update(b"generation base")
             .finalize();
-        argon2::hprime(&mut offsets_bytes, &offset_bytes_input);
+        argon2::hprime(&mut offset_base, &offset_base_input);
 
-        let offsets = offsets_bytes;
-
+        // 4. assemble each output chunk from XOR-combined pre-ROM chunks
+        let nb_source_chunks = pre_size / CHUNK;
         let mut digest = Blake2b::<512>::new();
-        let nb_source_chunks = (pre_size / 64) as u32;
-        for (i, chunk) in output.chunks_mut(64).enumerate() {
-            let start_idx = offsets[i % offsets.len()] as u32 % nb_source_chunks;
-
-            let idx0 = (i as u32) % nb_source_chunks;
-            let offset = (idx0 as usize).wrapping_mul(64);
-            let input = &mixing_buffer[offset..offset + 64];
-            chunk.copy_from_slice(input);
+        for (i, chunk) in output.chunks_mut(CHUNK).enumerate() {
+            let base = (i % nb_source_chunks) * CHUNK;
+            chunk.copy_from_slice(&pre_rom[base..base + CHUNK]);
 
             for d in 1..mixing_numbers {
-                let idx = start_idx.wrapping_add(offsets_diff[(d - 1) % offsets_diff.len()] as u32)
+                let src = (i
+                    + offset_base[i] as usize
+                    + offsets_diff[(d - 1) % offsets_diff.len()] as usize)
                     % nb_source_chunks;
-                let offset = (idx as usize).wrapping_mul(64);
-                let input = &mixing_buffer[offset..offset + 64];
-                xorbuf(chunk, input);
+                let off = src * CHUNK;
+                xorbuf(chunk, &pre_rom[off..off + CHUNK]);
             }
 
             digest.update_mut(chunk);
@@ -161,25 +176,13 @@ fn random_gen(gen_type: RomGenerationType, seed: [u8; 32], output: &mut [u8]) ->
     }
 }
 
+// XOR `input` into `out` byte-by-byte. Both slices must have equal length.
+// The straightforward loop auto-vectorizes and avoids the unaligned `u64`
+// reads (undefined behavior) of the previous hand-rolled version.
 fn xorbuf(out: &mut [u8], input: &[u8]) {
-    assert_eq!(out.len(), input.len());
-    assert_eq!(out.len(), 64);
-    /* implement xoring of all the bytes:
+    debug_assert_eq!(out.len(), input.len());
     for (o, i) in out.iter_mut().zip(input.iter()) {
-        *o ^= i;
-    }
-    */
-    let input = input.as_ptr() as *const u64;
-    let out = out.as_mut_ptr() as *mut u64;
-    unsafe {
-        *out.offset(0) ^= *input.offset(0);
-        *out.offset(1) ^= *input.offset(1);
-        *out.offset(2) ^= *input.offset(2);
-        *out.offset(3) ^= *input.offset(3);
-        *out.offset(4) ^= *input.offset(4);
-        *out.offset(5) ^= *input.offset(5);
-        *out.offset(6) ^= *input.offset(6);
-        *out.offset(7) ^= *input.offset(7);
+        *o ^= *i;
     }
 }
 

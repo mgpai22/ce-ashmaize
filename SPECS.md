@@ -9,8 +9,8 @@ Function AshMaize(key, value, preRomSize, romSize, nbInstructions, nbLoops)
     # Inputs:
     #   key:             Bytes
     #   value_to_hash:   Bytes
-    #   preRomSize:      Integer (32..2^32-1)
-    #   romSize:         Integer (32..2^32-1)
+    #   preRomSize:      Integer, non-zero multiple of 64, <= romSize (TwoStep only)
+    #   romSize:         Integer, non-zero multiple of 64, in 64..2^32-1
     #   nbInstructions:  Integer (128..2^32-1)
     #   nbLoops:         Integer (2..)
     # Output:
@@ -66,23 +66,32 @@ not reduce the need for fast prefetching from RAM.
 
 ```
 Function Rom1Step(key, romSize)
-  return argon2Hprime(LE32(romSize) | seed, romSize)
+    seed = Digest(LE32(romSize) | key)
+    return argon2Hprime(seed, romSize)
 
-Function Rom2Steps(key, preRomSize, romSize)
+Function Rom2Steps(key, preRomSize, romSize, mixingNumbers)
+    # preRomSize and romSize MUST be non-zero multiples of 64, with preRomSize <= romSize.
+    # mixingNumbers (>= 1) is the TwoStep parameter giving the number of source chunks
+    # combined per output chunk (1 copy + mixingNumbers-1 XORs).
+    # pre-rom[k] / rom[k] below denote the k-th 64-byte chunk.
     seed = Digest(LE32(romSize) | key)
     pre-rom = argon2Hprime(seed, preRomSize)
 
+    # 128 u16 relative offsets, shared by every output chunk
     for i in 0..4
-        offset-diff[i] = u16s(Digest(seed | "generation offset" | LE32(i))
+        offset-diff[i*32 .. i*32+32] = u16s(Digest(seed | "generation offset" | LE32(i)))
 
-    offset-base = argon2Hprime(Digest(seed | "generation base"), romSize)
+    nbSourceChunks = preRomSize / 64
+    nbOutChunks    = romSize / 64
+    # one base-offset byte per output chunk
+    offset-base = argon2Hprime(Digest(seed | "generation base"), nbOutChunks)
 
     rom = allocate(romSize)
-    for i, chunk in chunks(64, rom)
-        chunk = pre-rom[i]
-
+    for i, chunk in enumerate(chunks(64, rom))
+        chunk = pre-rom[i mod nbSourceChunks]                         # copy one source chunk
         for d in 1..mixingNumbers
-            chunk ^= pre-rom[i + offset-base[i] + offset-diff[i]]
+            src = (i + offset-base[i] + offset-diff[(d-1) mod 128]) mod nbSourceChunks
+            chunk ^= pre-rom[src]                                     # XOR another source chunk
     return rom
 ```
 
@@ -100,8 +109,8 @@ similar to a simplistic CPU. It is composed of:
 * 32 64-bits registers
 * Program counter (PC)
 * 2 special hash digest accumulators: one for program (PROG_DIGEST used for special1) and one for memory (MEM_DIGST used for special2)
-* a memory access counter (MC)
-* a loop counter (LC)
+* a memory access counter (MC): a 32-bit counter, serialized as 32-bit little-endian when hashed
+* a loop counter (LC): a 32-bit counter, serialized as 32-bit little-endian when hashed
 
 ### Initialization
 
@@ -148,9 +157,13 @@ Function vmExecute(nbLoops, nbInstructions, vm, rom)
     PostInstructions()
 
 Function ProgramExecute(program)
+  # PC is VM state, initialized to 0 once at VM init and NEVER reset between loops.
+  # program[PC] denotes program[PC mod nbInstructions].
   REPEAT nb_instructions
-    instruction = InstructionDecode(program[PC])
-    executeInstruction(instruction)
+    instruction_bytes = program[PC mod nbInstructions]
+    executeInstruction(InstructionDecode(instruction_bytes))
+    PROG_DIGEST = DigestUpdate(PROG_DIGEST, instruction_bytes)
+    PC = PC + 1
 
 Function ProgramGenerate(PROG_SEED, nbInstructions)
   return Argon2Hprime(nbInstructions * INSTRUCTION_SIZE, PROG_SEED)
@@ -158,8 +171,11 @@ Function ProgramGenerate(PROG_SEED, nbInstructions)
 Function PostInstructions()
   sum_regs = REG[0] + REGS[1] + ... + REGS[NB_REGS-1]
 
-  prog_value = DigestFinalize(DigestUpdate(PROG_DIGEST, LE(sum_regs))
-  mem_value = DigestFinalize(DigestUpdate(MEM_DIGEST, LE(sum_regs))
+  # DigestUpdate mutates the persistent PROG_DIGEST/MEM_DIGEST in place (so LE(sum_regs)
+  # stays part of the accumulator for later loops and for VmFinalize); prog_value/mem_value
+  # are read by finalizing a non-destructive clone of the updated context.
+  DigestUpdate(PROG_DIGEST, LE(sum_regs)); prog_value = DigestFinalize(Clone(PROG_DIGEST))
+  DigestUpdate(MEM_DIGEST, LE(sum_regs));  mem_value  = DigestFinalize(Clone(MEM_DIGEST))
 
   NB_MIXING = 32
   mixing = Argon2Hprime(NB_MIXING * NB_REGS * REGISTER_SIZE, Digest(prog_value || mem_value || LC))
@@ -168,7 +184,7 @@ Function PostInstructions()
       REG[i] ^= LE(mixing[0..8])
       mixing += 8
 
-  PROG_SEED = prog_digest
+  PROG_SEED = prog_value
   LC += 1
 ```
 
@@ -193,8 +209,8 @@ Instructions supported by the Virtual machines:
 * *Add*: 64 bit integer addition between 3 operands `dst := src1 + src2`
 * *Mul*: 64 bit integer multiplication, all overflow ignored `dst := (src1 * src2) % 2^64`
 * *MulH*: 128 bit integer multiplication keeping only the highest 64 bits of a 128 bits: `dst := (src1 * src2) >> 64`
-* *Div*: 64 bit integer division. if the divisor is 0, then the divisor is replaced by special-value1. `dst := src1 / src2`
-* *Mod*: 64 bit integer modulus. if the divisor is 0, then the divisor is replaced by special-value1. `dst := src1 % src2`
+* *Div*: 64 bit integer division. if the divisor is 0, it is replaced by special-value1 (or by 1 if special-value1 is also 0). `dst := src1 / divisor`
+* *Mod*: 64 bit integer modulus. if the divisor is 0, it is replaced by special-value1 (or by 1 if special-value1 is also 0). `dst := src1 % divisor`
 * *Xor*: 64 bit bitwise xor. `dst = src1 ^ src2`
 * *RotL*: 64 bit rotate left. `dst = src1 <<< src2`
 * *RotR*: 64 bit rotate right. `dst = src1 >>> src2`
@@ -248,21 +264,27 @@ Each instructions in a program is 20 bytes with the following meaning:
 |-------------|--------|------|------|--------|----|----|----|------|------|
 | Size (bits) | 8      | 4    | 4    | 1      | 5  | 5  | 5  | 64   | 64   |
 
+The 20 instruction bytes are ordered: byte 0 = OpCode; byte 1 = (SOp1 << 4) | SOp2;
+bytes 2..4 = the register-index word; bytes 4..12 = Lit1; bytes 12..20 = Lit2.
+The register-index word is read big-endian as `rs = (byte[2] << 8) | byte[3]`; bit 15 is
+the unused bit; `r1 = (rs >> 10) & 0x1f`, `r2 = (rs >> 5) & 0x1f`, `r3 = rs & 0x1f`.
+Lit1 and Lit2 are little-endian u64 values.
+
 Source Operand (4 bits):
 
 * Register : Value will be coming from a VM register, as specified by r1 or r2 depending on the operand number
 * Memory : Value will be read from the ROM
 * Literal : Value will be the literal
-* Special1 : Value will be the program digest accumulator
-* Special2 : Value will be the memory digest accumulator
+* Special1 : the little-endian u64 of the first 8 bytes of PROG_DIGEST, obtained by finalizing a non-destructive clone of the accumulator
+* Special2 : the little-endian u64 of the first 8 bytes of MEM_DIGEST, obtained by finalizing a non-destructive clone of the accumulator
 
-| Source   | Value | Chances |
-|----------|-------|---------|
-| Register | 0-4   | 25%     |
-| Memory   | 5-8   | 25%     |
-| Literal  | 9-12  | 18.75%  |
-| Special1 | 13-14 | 12.5%   |
-| Special2 | 14-15 | 12.5%   |
+| Source   | Value   | Chances |
+|----------|---------|---------|
+| Register | [0-4[   | 25%     |
+| Memory   | [4-8[   | 25%     |
+| Literal  | [8-12[  | 25%     |
+| Special1 | [12-14[ | 12.5%   |
+| Special2 | [14-16[ | 12.5%   |
 
 Each memory read is using the lower 32 bits literal to index the 64 bytes data
 line in the ROM. The data line is subsequently added to the memory digest in
@@ -283,17 +305,22 @@ we randomly generate a new full program.
 
 ```
 Function Argon2Hprime(seed, size) =
+    # standard Argon2 H' (RFC 9106): variable-length and fully sequential.
+    # Blake2b_n denotes Blake2b with an n-byte output.
+    if size <= 64
+        return Blake2b_size(LE32(size) | seed)        # exactly `size` bytes
     output = []
-    V0 = Digest(LE32(size) | seed)
-    output.append(V0[0..32])
-    while output.len() > 64
-       V[i+1] = Digest(V[i])
-       output.append(V[i+1][0..32])
-    V[last] = Digest(V[last-1])
-    output.append(V[last][0..size - output.len()])
+    V = Blake2b_64(LE32(size) | seed)                 # first 64-byte block
+    output.append(V[0..32])
+    while size - output.len() > 64
+        V = Blake2b_64(V)
+        output.append(V[0..32])
+    V = Blake2b_64(V)
+    output.append(V[0 .. size - output.len()])        # final block, <= 64 bytes
     return output
 
-Function Digest(data) = Blake2b(data)
+Function Digest(data) = Blake2b-512(data)        # 64-byte output, used uniformly
 Function DigestUpdate(ctx, data) = Blake2bUpdate(ctx, data)
 Function DigestFinalize(ctx) = Blake2bFinalize(ctx)
+Function u16s(bytes) = parse `bytes` as a sequence of little-endian u16 values
 ```
